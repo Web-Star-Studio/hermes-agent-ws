@@ -324,6 +324,13 @@ PLATFORM_HINTS = {
         "attachments, audio as file attachments. You can also include image URLs "
         "in markdown format ![alt](url) and they will be uploaded as attachments."
     ),
+    "saas_web": (
+        "You are inside a web-based personal dashboard. The user is interacting "
+        "through a SaaS frontend backed by a private Hermes profile. Markdown is "
+        "supported. Keep responses structured for a dashboard/chat UI, and when "
+        "an external account connection is required, return the connection URL "
+        "plainly so the frontend can present it."
+    ),
     "signal": (
         "You are on a text messaging communication platform, Signal. "
         "Please do not use markdown as it does not render. "

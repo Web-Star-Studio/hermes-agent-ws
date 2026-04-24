@@ -2945,6 +2945,13 @@ class GatewayRunner:
             adapter.gateway_runner = self  # For cross-platform delivery
             return adapter
 
+        elif platform == Platform.SAAS_WEB:
+            from gateway.platforms.saas_web import SaasWebAdapter, check_saas_web_requirements
+            if not check_saas_web_requirements():
+                logger.warning("SaaS Web: aiohttp not installed")
+                return None
+            return SaasWebAdapter(config)
+
         elif platform == Platform.BLUEBUBBLES:
             from gateway.platforms.bluebubbles import BlueBubblesAdapter, check_bluebubbles_requirements
             if not check_bluebubbles_requirements():
@@ -2977,7 +2984,7 @@ class GatewayRunner:
         # connection, so HA events are always authorized.
         # Webhook events are authenticated via HMAC signature validation in
         # the adapter itself — no user allowlist applies.
-        if source.platform in (Platform.HOMEASSISTANT, Platform.WEBHOOK):
+        if source.platform in (Platform.HOMEASSISTANT, Platform.WEBHOOK, Platform.SAAS_WEB):
             return True
 
         user_id = source.user_id
@@ -3001,6 +3008,7 @@ class GatewayRunner:
             Platform.WEIXIN: "WEIXIN_ALLOWED_USERS",
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
             Platform.QQBOT: "QQ_ALLOWED_USERS",
+            Platform.SAAS_WEB: "SAAS_WEB_ALLOWED_USERS",
         }
         platform_group_env_map = {
             Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_USERS",
@@ -3023,6 +3031,7 @@ class GatewayRunner:
             Platform.WEIXIN: "WEIXIN_ALLOW_ALL_USERS",
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOW_ALL_USERS",
             Platform.QQBOT: "QQ_ALLOW_ALL_USERS",
+            Platform.SAAS_WEB: "SAAS_WEB_ALLOW_ALL_USERS",
         }
 
         # Per-platform allow-all flag (e.g., DISCORD_ALLOW_ALL_USERS=true)
@@ -3154,6 +3163,7 @@ class GatewayRunner:
                 Platform.WEIXIN:   "WEIXIN_ALLOWED_USERS",
                 Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
                 Platform.QQBOT:    "QQ_ALLOWED_USERS",
+                Platform.SAAS_WEB: "SAAS_WEB_ALLOWED_USERS",
             }
             if os.getenv(platform_env_map.get(platform, ""), "").strip():
                 return "ignore"

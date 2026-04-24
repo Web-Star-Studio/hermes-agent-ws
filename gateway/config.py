@@ -61,6 +61,7 @@ class Platform(Enum):
     DINGTALK = "dingtalk"
     API_SERVER = "api_server"
     WEBHOOK = "webhook"
+    SAAS_WEB = "saas_web"
     FEISHU = "feishu"
     WECOM = "wecom"
     WECOM_CALLBACK = "wecom_callback"
@@ -296,6 +297,9 @@ class GatewayConfig:
                 connected.append(platform)
             # Webhook uses enabled flag only (secrets are per-route)
             elif platform == Platform.WEBHOOK:
+                connected.append(platform)
+            # SaaS web adapter uses backend-authenticated HTTP, token optional on loopback
+            elif platform == Platform.SAAS_WEB:
                 connected.append(platform)
             # Feishu uses extra dict for app credentials
             elif platform == Platform.FEISHU and config.extra.get("app_id"):
@@ -1089,6 +1093,37 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                 pass
         if webhook_secret:
             config.platforms[Platform.WEBHOOK].extra["secret"] = webhook_secret
+
+    # SaaS web platform
+    saas_web_enabled = os.getenv("SAAS_WEB_ENABLED", "").lower() in ("true", "1", "yes")
+    saas_web_key = os.getenv("SAAS_WEB_KEY", "")
+    saas_web_port = os.getenv("SAAS_WEB_PORT")
+    saas_web_host = os.getenv("SAAS_WEB_HOST")
+    saas_web_callback_url = os.getenv("SAAS_WEB_CALLBACK_URL", "")
+    saas_web_callback_key = os.getenv("SAAS_WEB_CALLBACK_KEY", "")
+    if saas_web_enabled or saas_web_key:
+        if Platform.SAAS_WEB not in config.platforms:
+            config.platforms[Platform.SAAS_WEB] = PlatformConfig()
+        config.platforms[Platform.SAAS_WEB].enabled = True
+        if saas_web_key:
+            config.platforms[Platform.SAAS_WEB].extra["key"] = saas_web_key
+        if saas_web_host:
+            config.platforms[Platform.SAAS_WEB].extra["host"] = saas_web_host
+        if saas_web_port:
+            try:
+                config.platforms[Platform.SAAS_WEB].extra["port"] = int(saas_web_port)
+            except ValueError:
+                pass
+        if saas_web_callback_url:
+            config.platforms[Platform.SAAS_WEB].extra["callback_url"] = saas_web_callback_url
+        if saas_web_callback_key:
+            config.platforms[Platform.SAAS_WEB].extra["callback_key"] = saas_web_callback_key
+        user_id = os.getenv("SAAS_WEB_USER_ID", "")
+        user_name = os.getenv("SAAS_WEB_USER_NAME", "")
+        if user_id:
+            config.platforms[Platform.SAAS_WEB].extra["user_id"] = user_id
+        if user_name:
+            config.platforms[Platform.SAAS_WEB].extra["user_name"] = user_name
 
     # DingTalk
     dingtalk_client_id = os.getenv("DINGTALK_CLIENT_ID")
