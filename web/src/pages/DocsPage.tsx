@@ -4,6 +4,7 @@ import { useI18n } from "@/i18n";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { buttonVariants } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import { PluginSlot } from "@/plugins";
 
 export const HERMES_DOCS_URL = "https://hermes-agent.nousresearch.com/docs/";
 
@@ -35,9 +36,10 @@ export default function DocsPage() {
     <div
       className={cn(
         "flex min-h-0 w-full min-w-0 flex-1 flex-col",
-        "-mx-3 sm:-mx-6",
+        "pt-1 sm:pt-2",
       )}
     >
+      <PluginSlot name="docs:top" />
       <iframe
         title={t.app.nav.documentation}
         src={HERMES_DOCS_URL}
@@ -49,6 +51,7 @@ export default function DocsPage() {
         sandbox="allow-scripts allow-same-origin allow-popups allow-forms"
         referrerPolicy="no-referrer-when-downgrade"
       />
+      <PluginSlot name="docs:bottom" />
     </div>
   );
 }
