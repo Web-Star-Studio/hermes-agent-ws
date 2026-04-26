@@ -1,9 +1,10 @@
 """SaaS web platform adapter.
 
 This adapter is intended for product backends that sit between a browser UI
-and a per-user Hermes profile.  The browser should authenticate to the SaaS
-backend; the backend authenticates to this adapter over a private network or
-loopback interface.
+and a per-workspace Hermes profile.  The browser should authenticate to the
+SaaS backend; the backend authenticates to this adapter over a private network
+or loopback interface.  Inbound ``user_id`` values identify the human actor
+inside the workspace, not the Hermes profile itself.
 """
 
 import asyncio
@@ -77,6 +78,14 @@ class SaasWebAdapter(BasePlatformAdapter):
             "user_name",
             os.getenv("SAAS_WEB_USER_NAME", ""),
         )
+        self._workspace_id: str = extra.get(
+            "workspace_id",
+            os.getenv("SAAS_WEB_WORKSPACE_ID", ""),
+        )
+        self._workspace_name: str = extra.get(
+            "workspace_name",
+            os.getenv("SAAS_WEB_WORKSPACE_NAME", ""),
+        )
         self._max_body_bytes: int = int(extra.get("max_body_bytes", DEFAULT_MAX_BODY_BYTES))
         self._event_buffer_size: int = int(
             extra.get("event_buffer_size", DEFAULT_EVENT_BUFFER_SIZE)
@@ -92,6 +101,7 @@ class SaasWebAdapter(BasePlatformAdapter):
         self._events: Dict[str, Deque[dict]] = defaultdict(
             lambda: deque(maxlen=self._event_buffer_size)
         )
+        self._conversation_workspaces: Dict[str, tuple[str, str]] = {}
         self._event_seq = 0
 
     # ------------------------------------------------------------------
@@ -219,6 +229,8 @@ class SaasWebAdapter(BasePlatformAdapter):
                 "status": "ok",
                 "platform": "saas_web",
                 "callback_configured": bool(self._callback_url),
+                "workspace_id": self._workspace_id or None,
+                "workspace_name": self._workspace_name or None,
             }
         )
 
@@ -245,6 +257,8 @@ class SaasWebAdapter(BasePlatformAdapter):
         )
         user_id = str(body.get("user_id") or self._default_user_id or "saas_user")
         user_name = body.get("user_name") or self._default_user_name or None
+        workspace_id = str(body.get("workspace_id") or self._workspace_id or "")
+        workspace_name = str(body.get("workspace_name") or self._workspace_name or "")
         message_id = str(body.get("message_id") or f"in_{uuid.uuid4().hex}")
         thread_id = body.get("thread_id")
 
@@ -260,6 +274,8 @@ class SaasWebAdapter(BasePlatformAdapter):
                 status=200,
             )
         self._seen_messages[message_id] = now
+        if workspace_id or workspace_name:
+            self._conversation_workspaces[conversation_id] = (workspace_id, workspace_name)
 
         source = self.build_source(
             chat_id=conversation_id,
@@ -290,6 +306,7 @@ class SaasWebAdapter(BasePlatformAdapter):
                 "message_id": message_id,
                 "conversation_id": conversation_id,
                 "user_id": user_id,
+                "workspace_id": workspace_id or None,
             },
             status=202,
         )
@@ -343,6 +360,14 @@ class SaasWebAdapter(BasePlatformAdapter):
             "timestamp": datetime.now(timezone.utc).isoformat(),
             **payload,
         }
+        workspace_id, workspace_name = self._conversation_workspaces.get(
+            conversation_id,
+            (self._workspace_id, self._workspace_name),
+        )
+        if workspace_id and "workspace_id" not in event:
+            event["workspace_id"] = workspace_id
+        if workspace_name and "workspace_name" not in event:
+            event["workspace_name"] = workspace_name
         self._events[conversation_id].append(event)
         return event
 

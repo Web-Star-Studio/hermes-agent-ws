@@ -56,6 +56,8 @@ class TestAdapterInit:
             callback_key="callback-secret",
             user_id="user_123",
             user_name="Alice",
+            workspace_id="ws_123",
+            workspace_name="Personal",
         )
         assert adapter._host == "0.0.0.0"
         assert adapter._port == 9999
@@ -63,6 +65,8 @@ class TestAdapterInit:
         assert adapter._callback_key == "callback-secret"
         assert adapter._default_user_id == "user_123"
         assert adapter._default_user_name == "Alice"
+        assert adapter._workspace_id == "ws_123"
+        assert adapter._workspace_name == "Personal"
 
 
 class TestAuth:
@@ -110,6 +114,8 @@ class TestMessages:
                     "conversation_name": "Daily dashboard",
                     "message_id": "msg_1",
                     "thread_id": "thread_a",
+                    "workspace_id": "ws_123",
+                    "workspace_name": "Personal",
                 },
                 headers={"Authorization": "Bearer backend-secret"},
             )
@@ -117,6 +123,7 @@ class TestMessages:
             payload = await resp.json()
             assert payload["conversation_id"] == "conv_day"
             assert payload["user_id"] == "default_user"
+            assert payload["workspace_id"] == "ws_123"
 
             await asyncio.sleep(0)
             adapter.handle_message.assert_awaited_once()
@@ -130,6 +137,7 @@ class TestMessages:
             assert event.source.user_id == "default_user"
             assert event.source.user_name == "Default User"
             assert event.source.thread_id == "thread_a"
+            assert event.raw_message["workspace_id"] == "ws_123"
         finally:
             await client.close()
 
@@ -203,6 +211,8 @@ class TestDelivery:
         adapter = _make_adapter(
             callback_url=str(callback_client.make_url("/callback")),
             callback_key="callback-secret",
+            workspace_id="ws_123",
+            workspace_name="Personal",
         )
         try:
             result = await adapter.send("conv_1", "hello callback")
@@ -211,6 +221,8 @@ class TestDelivery:
             assert received[0]["auth"] == "Bearer callback-secret"
             assert received[0]["body"]["event"] == "message"
             assert received[0]["body"]["conversation_id"] == "conv_1"
+            assert received[0]["body"]["workspace_id"] == "ws_123"
+            assert received[0]["body"]["workspace_name"] == "Personal"
             assert received[0]["body"]["content"] == "hello callback"
         finally:
             await adapter.disconnect()
@@ -224,6 +236,7 @@ class TestConfig:
         monkeypatch.setenv("SAAS_WEB_PORT", "9001")
         monkeypatch.setenv("SAAS_WEB_CALLBACK_URL", "http://backend/events")
         monkeypatch.setenv("SAAS_WEB_USER_ID", "user_123")
+        monkeypatch.setenv("SAAS_WEB_WORKSPACE_ID", "ws_123")
 
         config = GatewayConfig()
         _apply_env_overrides(config)
@@ -234,3 +247,4 @@ class TestConfig:
         assert platform_config.extra["port"] == 9001
         assert platform_config.extra["callback_url"] == "http://backend/events"
         assert platform_config.extra["user_id"] == "user_123"
+        assert platform_config.extra["workspace_id"] == "ws_123"

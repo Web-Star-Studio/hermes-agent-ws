@@ -1120,10 +1120,16 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             config.platforms[Platform.SAAS_WEB].extra["callback_key"] = saas_web_callback_key
         user_id = os.getenv("SAAS_WEB_USER_ID", "")
         user_name = os.getenv("SAAS_WEB_USER_NAME", "")
+        workspace_id = os.getenv("SAAS_WEB_WORKSPACE_ID", "")
+        workspace_name = os.getenv("SAAS_WEB_WORKSPACE_NAME", "")
         if user_id:
             config.platforms[Platform.SAAS_WEB].extra["user_id"] = user_id
         if user_name:
             config.platforms[Platform.SAAS_WEB].extra["user_name"] = user_name
+        if workspace_id:
+            config.platforms[Platform.SAAS_WEB].extra["workspace_id"] = workspace_id
+        if workspace_name:
+            config.platforms[Platform.SAAS_WEB].extra["workspace_name"] = workspace_name
 
     # DingTalk
     dingtalk_client_id = os.getenv("DINGTALK_CLIENT_ID")

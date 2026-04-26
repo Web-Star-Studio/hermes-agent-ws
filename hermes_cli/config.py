@@ -1895,6 +1895,22 @@ OPTIONAL_ENV_VARS = {
         "category": "messaging",
         "advanced": True,
     },
+    "SAAS_WEB_WORKSPACE_ID": {
+        "description": "SaaS workspace ID represented by this Hermes profile. Included in adapter health and callback events.",
+        "prompt": "SaaS workspace ID",
+        "url": None,
+        "password": False,
+        "category": "messaging",
+        "advanced": True,
+    },
+    "SAAS_WEB_WORKSPACE_NAME": {
+        "description": "SaaS workspace display name represented by this Hermes profile. Included in adapter health and callback events.",
+        "prompt": "SaaS workspace name",
+        "url": None,
+        "password": False,
+        "category": "messaging",
+        "advanced": True,
+    },
     "GATEWAY_PROXY_URL": {
         "description": "URL of a remote Hermes API server to forward messages to (proxy mode). When set, the gateway handles platform I/O only — all agent work is delegated to the remote server. Use for Docker E2EE containers that relay to a host agent. Also configurable via gateway.proxy_url in config.yaml.",
         "prompt": "Remote Hermes API server URL (e.g. http://192.168.1.100:8642)",
