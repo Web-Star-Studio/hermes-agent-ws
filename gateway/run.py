@@ -25,6 +25,7 @@ import signal
 import tempfile
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
@@ -521,6 +522,30 @@ def _load_gateway_config() -> dict:
     return {}
 
 
+def _safe_event_preview(value: Any, limit: int = 500) -> str:
+    """Return a compact, JSON-friendly preview for runtime UI events."""
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        try:
+            value = json.dumps(value, ensure_ascii=False, default=str)
+        except Exception:
+            value = str(value)
+    value = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", value)
+    if len(value) > limit:
+        return value[: max(0, limit - 3)] + "..."
+    return value
+
+
+def _safe_reasoning_summary(value: Any, limit: int = 1200) -> tuple[str, bool]:
+    """Create a capped reasoning summary/excerpt without exposing full traces."""
+    text = _safe_event_preview(value, limit + 1).strip()
+    truncated = len(text) > limit
+    if truncated:
+        text = text[: max(0, limit - 3)].rstrip() + "..."
+    return text, truncated
+
+
 def _resolve_gateway_model(config: dict | None = None) -> str:
     """Read model from config.yaml — single source of truth.
 
@@ -1000,6 +1025,39 @@ class GatewayRunner:
             source,
             group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
+        )
+
+    def _get_saas_rich_adapter(self, source: Optional[SessionSource]):
+        """Return the SaaS web adapter when rich runtime events are enabled."""
+        if not source or source.platform != Platform.SAAS_WEB:
+            return None
+        adapter = self.adapters.get(Platform.SAAS_WEB)
+        if adapter is not None and getattr(adapter, "rich_events_enabled", False):
+            return adapter
+        return None
+
+    async def _emit_saas_rich_event(
+        self,
+        source: SessionSource,
+        event_type: str,
+        payload: Optional[Dict[str, Any]] = None,
+        *,
+        run_id: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        parent_message_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[dict]:
+        adapter = self._get_saas_rich_adapter(source)
+        if adapter is None or not hasattr(adapter, "emit_runtime_event"):
+            return None
+        return await adapter.emit_runtime_event(
+            source.chat_id,
+            event_type,
+            payload or {},
+            run_id=run_id,
+            reply_to=reply_to,
+            parent_message_id=parent_message_id,
+            metadata=metadata,
         )
 
     def _resolve_session_agent_runtime(
@@ -4592,6 +4650,18 @@ class GatewayRunner:
             await self.hooks.emit("agent:start", hook_ctx)
 
             # Run the agent
+            _rich_run_id = event.message_id or f"run_{uuid.uuid4().hex}"
+            _rich_reply_to = event.message_id
+            if self._get_saas_rich_adapter(source) is not None:
+                await self._emit_saas_rich_event(
+                    source,
+                    "run.started",
+                    {"status": "running"},
+                    run_id=_rich_run_id,
+                    reply_to=_rich_reply_to,
+                    parent_message_id=event.message_id,
+                )
+
             agent_result = await self._run_agent(
                 message=message_text,
                 context_prompt=context_prompt,
@@ -4893,7 +4963,30 @@ class GatewayRunner:
                         await self._deliver_media_from_response(
                             response, event, _media_adapter,
                         )
+                if self._get_saas_rich_adapter(source) is not None:
+                    await self._emit_saas_rich_event(
+                        source,
+                        "run.completed",
+                        {"duration_ms": int((time.time() - _msg_start_time) * 1000)},
+                        run_id=_rich_run_id,
+                        reply_to=_rich_reply_to,
+                        parent_message_id=event.message_id,
+                    )
                 return None
+
+            if self._get_saas_rich_adapter(source) is not None:
+                _run_event = "run.failed" if agent_result.get("failed") else "run.completed"
+                _payload = {"duration_ms": int((time.time() - _msg_start_time) * 1000)}
+                if _run_event == "run.failed":
+                    _payload["error"] = _safe_event_preview(agent_result.get("error") or response, 300)
+                await self._emit_saas_rich_event(
+                    source,
+                    _run_event,
+                    _payload,
+                    run_id=_rich_run_id,
+                    reply_to=_rich_reply_to,
+                    parent_message_id=event.message_id,
+                )
 
             return response
             
@@ -4908,6 +5001,18 @@ class GatewayRunner:
             logger.exception("Agent error in session %s", session_key)
             error_type = type(e).__name__
             error_detail = str(e)[:300] if str(e) else "no details available"
+            try:
+                if self._get_saas_rich_adapter(source) is not None:
+                    await self._emit_saas_rich_event(
+                        source,
+                        "run.failed",
+                        {"error": _safe_event_preview(f"{error_type}: {error_detail}", 300)},
+                        run_id=getattr(event, "message_id", None),
+                        reply_to=getattr(event, "message_id", None),
+                        parent_message_id=getattr(event, "message_id", None),
+                    )
+            except Exception:
+                pass
             status_hint = ""
             status_code = getattr(e, "status_code", None)
             _hist_len = len(history) if 'history' in locals() else 0
@@ -9296,7 +9401,30 @@ class GatewayRunner:
 
         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
             """Callback invoked by agent on tool lifecycle events."""
-            if not progress_queue or not _run_still_current():
+            if not _run_still_current():
+                return
+
+            if _rich_enabled:
+                if event_type == "tool.started":
+                    _rich_tool_start_previews.setdefault(tool_name or "", []).append(
+                        {
+                            "preview": _safe_event_preview(preview, 240),
+                            "args_keys": sorted(list((args or {}).keys())),
+                        }
+                    )
+                elif event_type == "tool.completed":
+                    meta = {
+                        "duration_ms": int(float(kwargs.get("duration") or 0) * 1000),
+                        "is_error": bool(kwargs.get("is_error")),
+                    }
+                    _rich_tool_completion_meta.setdefault(tool_name or "", []).append(meta)
+                elif event_type == "reasoning.available":
+                    _emit_rich_sync(
+                        "reasoning.started",
+                        {"status": "available"},
+                    )
+
+            if not progress_queue:
                 return
 
             # First-touch onboarding: the first time a tool takes longer than
@@ -9399,6 +9527,67 @@ class GatewayRunner:
             repeat_count[0] = 0
             
             progress_queue.put(msg)
+
+        def _rich_tool_start_callback(tool_call_id: str, tool_name: str, args: dict) -> None:
+            preview_queue = _rich_tool_start_previews.get(tool_name or "") or []
+            preview_meta = preview_queue.pop(0) if preview_queue else {}
+            args_keys = preview_meta.get("args_keys") or sorted(list((args or {}).keys()))
+            _emit_rich_sync(
+                "tool.started",
+                {
+                    "tool_call_id": tool_call_id,
+                    "tool_name": tool_name or "",
+                    "preview": preview_meta.get("preview") or _safe_event_preview(args_keys, 240),
+                    "args_keys": args_keys,
+                },
+            )
+
+        def _rich_tool_complete_callback(
+            tool_call_id: str,
+            tool_name: str,
+            args: dict,
+            result: Any,
+        ) -> None:
+            meta_queue = _rich_tool_completion_meta.get(tool_name or "") or []
+            meta = meta_queue.pop(0) if meta_queue else {}
+            duration_ms = int(meta.get("duration_ms") or 0)
+            is_error = bool(meta.get("is_error"))
+            _emit_rich_sync(
+                "tool.failed" if is_error else "tool.completed",
+                {
+                    "tool_call_id": tool_call_id,
+                    "tool_name": tool_name or "",
+                    "duration_ms": duration_ms,
+                    "result_preview": _safe_event_preview(result, 500),
+                },
+            )
+
+        def _rich_stream_delta_callback(text: str) -> None:
+            if text is None:
+                return
+            if not _run_still_current():
+                return
+            delta = str(text)
+            if not delta:
+                return
+            _rich_delta_index[0] += 1
+            _emit_rich_sync(
+                "message.delta",
+                {
+                    "delta": delta,
+                    "index": _rich_delta_index[0],
+                },
+            )
+
+        def _rich_reasoning_callback(text: str) -> None:
+            if not text or not _run_still_current():
+                return
+            if not _rich_reasoning_started[0]:
+                _rich_reasoning_started[0] = True
+                _emit_rich_sync("reasoning.started", {"status": "streaming"})
+            current = "".join(_rich_reasoning_buf)
+            if len(current) < 1200:
+                _rich_reasoning_buf.append(str(text)[: max(0, 1200 - len(current))])
         
         # Background task to send progress messages
         # Accumulates tool lines into a single message that gets edited.
@@ -9585,17 +9774,26 @@ class GatewayRunner:
                         _names.append(_t.get("name") or "")
                     else:
                         _names.append(str(_t))
-                asyncio.run_coroutine_threadsafe(
-                    _hooks_ref.emit("agent:step", {
-                        "platform": source.platform.value if source.platform else "",
-                        "user_id": source.user_id,
-                        "session_id": session_id,
-                        "iteration": iteration,
-                        "tool_names": _names,
-                        "tools": prev_tools,
-                    }),
-                    _loop_for_step,
-                )
+                if _rich_enabled:
+                    _emit_rich_sync(
+                        "step.completed",
+                        {
+                            "iteration": iteration,
+                            "tool_names": [name for name in _names if name],
+                        },
+                    )
+                if _hooks_ref.loaded_hooks:
+                    asyncio.run_coroutine_threadsafe(
+                        _hooks_ref.emit("agent:step", {
+                            "platform": source.platform.value if source.platform else "",
+                            "user_id": source.user_id,
+                            "session_id": session_id,
+                            "iteration": iteration,
+                            "tool_names": _names,
+                            "tools": prev_tools,
+                        }),
+                        _loop_for_step,
+                    )
             except Exception as _e:
                 logger.debug("agent:step hook error: %s", _e)
 
@@ -9603,9 +9801,46 @@ class GatewayRunner:
         _status_adapter = self.adapters.get(source.platform)
         _status_chat_id = source.chat_id
         _status_thread_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
+        _rich_adapter = self._get_saas_rich_adapter(source)
+        _rich_enabled = _rich_adapter is not None
+        _rich_run_id = event_message_id or f"run_{uuid.uuid4().hex}"
+        _rich_reply_to = event_message_id
+        _rich_parent_message_id = event_message_id
+        _rich_delta_index = [0]
+        _rich_reasoning_started = [False]
+        _rich_reasoning_buf: list[str] = []
+        _rich_tool_start_previews: dict[str, list[dict]] = {}
+        _rich_tool_completion_meta: dict[str, list[dict]] = {}
+
+        def _emit_rich_sync(event_type: str, payload: Optional[Dict[str, Any]] = None) -> None:
+            if not _rich_enabled or not _run_still_current():
+                return
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self._emit_saas_rich_event(
+                        source,
+                        event_type,
+                        payload or {},
+                        run_id=_rich_run_id,
+                        reply_to=_rich_reply_to,
+                        parent_message_id=_rich_parent_message_id,
+                    ),
+                    _loop_for_step,
+                )
+            except Exception as _e:
+                logger.debug("saas rich event error (%s): %s", event_type, _e)
 
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
+                return
+            if _rich_enabled:
+                _emit_rich_sync(
+                    "status",
+                    {
+                        "status": _safe_event_preview(event_type or "status", 80),
+                        "content": _safe_event_preview(message, 500),
+                    },
+                )
                 return
             try:
                 asyncio.run_coroutine_threadsafe(
@@ -9702,7 +9937,7 @@ class GatewayRunner:
                 if _plat_streaming is None
                 else bool(_plat_streaming)
             )
-            _want_stream_deltas = _streaming_enabled
+            _want_stream_deltas = _streaming_enabled and not _rich_enabled
             _want_interim_messages = interim_assistant_messages_enabled
             _want_interim_consumer = _want_interim_messages
             if _want_stream_deltas or _want_interim_consumer:
@@ -9745,6 +9980,16 @@ class GatewayRunner:
                         stream_consumer_holder[0] = _stream_consumer
                 except Exception as _sc_err:
                     logger.debug("Could not set up stream consumer: %s", _sc_err)
+
+            if _rich_enabled:
+                if _stream_delta_cb is None:
+                    _stream_delta_cb = _rich_stream_delta_callback
+                else:
+                    _platform_stream_delta_cb = _stream_delta_cb
+
+                    def _stream_delta_cb(text: str) -> None:
+                        _platform_stream_delta_cb(text)
+                        _rich_stream_delta_callback(text)
 
             def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
                 if not _run_still_current():
@@ -9838,11 +10083,14 @@ class GatewayRunner:
 
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
-            agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
-            agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
+            agent.tool_progress_callback = progress_callback if (tool_progress_enabled or _rich_enabled) else None
+            agent.tool_start_callback = _rich_tool_start_callback if _rich_enabled else None
+            agent.tool_complete_callback = _rich_tool_complete_callback if _rich_enabled else None
+            agent.step_callback = _step_callback_sync if (_hooks_ref.loaded_hooks or _rich_enabled) else None
             agent.stream_delta_callback = _stream_delta_cb
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
             agent.status_callback = _status_callback_sync
+            agent.reasoning_callback = _rich_reasoning_callback if _rich_enabled else None
             agent.reasoning_config = reasoning_config
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides")
@@ -9853,6 +10101,15 @@ class GatewayRunner:
 
             def _deliver_bg_review_message(message: str) -> None:
                 if not _status_adapter or not _run_still_current():
+                    return
+                if _rich_enabled:
+                    _emit_rich_sync(
+                        "status",
+                        {
+                            "status": "background_review",
+                            "content": _safe_event_preview(message, 500),
+                        },
+                    )
                     return
                 try:
                     asyncio.run_coroutine_threadsafe(
@@ -10113,6 +10370,21 @@ class GatewayRunner:
                 reset_current_session_key(_approval_session_token)
             result_holder[0] = result
 
+            if _rich_enabled:
+                reasoning_source = result.get("last_reasoning") or "".join(_rich_reasoning_buf)
+                summary, truncated = _safe_reasoning_summary(reasoning_source)
+                if summary:
+                    if not _rich_reasoning_started[0]:
+                        _rich_reasoning_started[0] = True
+                        _emit_rich_sync("reasoning.started", {"status": "available"})
+                    _emit_rich_sync(
+                        "reasoning.summary",
+                        {
+                            "summary": summary,
+                            "truncated": truncated,
+                        },
+                    )
+
             # Signal the stream consumer that the agent is done
             if _stream_consumer is not None:
                 _stream_consumer.finish()
@@ -10365,11 +10637,22 @@ class GatewayRunner:
                     except Exception:
                         pass
                 try:
-                    await _notify_adapter.send(
-                        source.chat_id,
-                        f"⏳ Still working... ({_elapsed_mins} min elapsed{_status_detail})",
-                        metadata=_status_thread_metadata,
-                    )
+                    _content = f"Still working... ({_elapsed_mins} min elapsed{_status_detail})"
+                    if _rich_enabled:
+                        await self._emit_saas_rich_event(
+                            source,
+                            "status",
+                            {"status": "still_working", "content": _content},
+                            run_id=_rich_run_id,
+                            reply_to=_rich_reply_to,
+                            parent_message_id=_rich_parent_message_id,
+                        )
+                    else:
+                        await _notify_adapter.send(
+                            source.chat_id,
+                            f"⏳ {_content}",
+                            metadata=_status_thread_metadata,
+                        )
                 except Exception as _ne:
                     logger.debug("Long-running notification error: %s", _ne)
 
@@ -10456,14 +10739,27 @@ class GatewayRunner:
                             _elapsed_warn = int(_agent_warning // 60) or 1
                             _remaining_mins = int((_agent_timeout - _agent_warning) // 60) or 1
                             try:
-                                await _warn_adapter.send(
-                                    source.chat_id,
-                                    f"⚠️ No activity for {_elapsed_warn} min. "
+                                _warn_content = (
+                                    f"No activity for {_elapsed_warn} min. "
                                     f"If the agent does not respond soon, it will "
                                     f"be timed out in {_remaining_mins} min. "
-                                    f"You can continue waiting or use /reset.",
-                                    metadata=_status_thread_metadata,
+                                    f"You can continue waiting or use /reset."
                                 )
+                                if _rich_enabled:
+                                    await self._emit_saas_rich_event(
+                                        source,
+                                        "status",
+                                        {"status": "inactivity_warning", "content": _warn_content},
+                                        run_id=_rich_run_id,
+                                        reply_to=_rich_reply_to,
+                                        parent_message_id=_rich_parent_message_id,
+                                    )
+                                else:
+                                    await _warn_adapter.send(
+                                        source.chat_id,
+                                        f"⚠️ {_warn_content}",
+                                        metadata=_status_thread_metadata,
+                                    )
                             except Exception as _warn_err:
                                 logger.debug("Inactivity warning send error: %s", _warn_err)
                     if _idle_secs >= _agent_timeout:

@@ -1,6 +1,11 @@
 """Tests for the SaaS web platform adapter."""
 
 import asyncio
+import importlib
+import sys
+import time
+import types
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -9,6 +14,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig, _apply_env_overrides
 from gateway.platforms.base import MessageEvent
+from gateway.session import SessionSource
 from gateway.platforms.saas_web import (
     SaasWebAdapter,
     check_saas_web_requirements,
@@ -227,6 +233,244 @@ class TestDelivery:
         finally:
             await adapter.disconnect()
             await callback_client.close()
+
+
+class TestRichEvents:
+    @pytest.mark.asyncio
+    async def test_rich_event_records_and_callbacks_when_enabled(self):
+        received = []
+
+        async def callback(request):
+            received.append(await request.json())
+            return web.json_response({"ok": True})
+
+        callback_app = web.Application()
+        callback_app.router.add_post("/callback", callback)
+        callback_client = TestClient(TestServer(callback_app))
+        await callback_client.start_server()
+
+        adapter = _make_adapter(
+            callback_url=str(callback_client.make_url("/callback")),
+            rich_events=True,
+            workspace_id="ws_123",
+            workspace_name="Personal",
+        )
+        try:
+            event = await adapter.emit_runtime_event(
+                "conv_1",
+                "tool.started",
+                {
+                    "tool_call_id": "call_1",
+                    "tool_name": "terminal",
+                    "preview": "pwd",
+                    "args_keys": ["command"],
+                },
+                run_id="msg_user_1",
+                reply_to="msg_user_1",
+                parent_message_id="msg_user_1",
+            )
+
+            assert event["event"] == "tool.started"
+            assert event["run_id"] == "msg_user_1"
+            assert event["workspace_id"] == "ws_123"
+            assert event["metadata"] == {}
+            assert received[0]["message_id"].startswith("evt_")
+            assert received[0]["seq"] == event["seq"]
+
+            client = TestClient(TestServer(_create_app(adapter)))
+            await client.start_server()
+            try:
+                resp = await client.get(
+                    "/events/conv_1",
+                    headers={"Authorization": "Bearer backend-secret"},
+                )
+                events = (await resp.json())["events"]
+                assert [item["seq"] for item in events] == sorted(item["seq"] for item in events)
+                assert events[0]["event"] == "tool.started"
+            finally:
+                await client.close()
+        finally:
+            await adapter.disconnect()
+            await callback_client.close()
+
+    @pytest.mark.asyncio
+    async def test_rich_event_ignored_when_disabled(self):
+        adapter = _make_adapter(rich_events=False)
+        event = await adapter.emit_runtime_event(
+            "conv_1",
+            "message.delta",
+            {"delta": "hello", "index": 1},
+            run_id="msg_1",
+        )
+        assert event is None
+        assert list(adapter._events.get("conv_1", ())) == []
+
+    def test_env_overrides_rich_events(self, monkeypatch):
+        monkeypatch.setenv("SAAS_WEB_ENABLED", "true")
+        monkeypatch.setenv("SAAS_WEB_KEY", "secret")
+        monkeypatch.setenv("SAAS_WEB_RICH_EVENTS", "true")
+
+        config = GatewayConfig()
+        _apply_env_overrides(config)
+
+        assert config.platforms[Platform.SAAS_WEB].extra["rich_events"] == "true"
+
+
+class RichFakeAgent:
+    def __init__(self, **kwargs):
+        self.tools = []
+        self.tool_progress_callback = None
+        self.tool_start_callback = None
+        self.tool_complete_callback = None
+        self.step_callback = None
+        self.stream_delta_callback = None
+        self.reasoning_callback = None
+        self.status_callback = None
+        self.background_review_callback = None
+        self.context_compressor = SimpleNamespace(last_prompt_tokens=0)
+        self.session_prompt_tokens = 0
+        self.session_completion_tokens = 0
+        self.model = kwargs.get("model", "fake-model")
+        self.session_id = kwargs.get("session_id")
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        if self.status_callback:
+            self.status_callback("context_pressure", "Context pressure is high")
+        if self.reasoning_callback:
+            self.reasoning_callback("private reasoning " * 200)
+        if self.tool_progress_callback:
+            self.tool_progress_callback(
+                "tool.started",
+                "terminal",
+                "pwd",
+                {"command": "pwd", "secret": "do-not-emit-full-result"},
+            )
+        if self.tool_start_callback:
+            self.tool_start_callback("call_1", "terminal", {"command": "pwd"})
+        time.sleep(0.01)
+        if self.tool_progress_callback:
+            self.tool_progress_callback(
+                "tool.completed",
+                "terminal",
+                None,
+                None,
+                duration=1.234,
+                is_error=False,
+            )
+        if self.tool_complete_callback:
+            self.tool_complete_callback("call_1", "terminal", {"command": "pwd"}, "x" * 2000)
+        if self.step_callback:
+            self.step_callback(2, [{"name": "terminal", "result": "raw result", "arguments": "{}"}])
+        if self.stream_delta_callback:
+            self.stream_delta_callback("Hello")
+            self.stream_delta_callback(" world")
+        return {
+            "final_response": "Hello world",
+            "last_reasoning": "summary " * 400,
+            "messages": [
+                {"role": "user", "content": message},
+                {"role": "assistant", "content": "Hello world"},
+            ],
+            "api_calls": 1,
+        }
+
+
+def _make_rich_runner(adapter):
+    gateway_run = importlib.import_module("gateway.run")
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner.adapters = {Platform.SAAS_WEB: adapter}
+    runner._voice_mode = {}
+    runner._prefill_messages = []
+    runner._ephemeral_system_prompt = ""
+    runner._reasoning_config = None
+    runner._provider_routing = {}
+    runner._fallback_model = None
+    runner._session_db = None
+    runner._running_agents = {}
+    runner._session_run_generation = {}
+    runner._agent_cache = None
+    runner._agent_cache_lock = None
+    runner._draining = False
+    runner.hooks = SimpleNamespace(loaded_hooks=False)
+    runner.config = SimpleNamespace(
+        thread_sessions_per_user=False,
+        group_sessions_per_user=False,
+        stt_enabled=False,
+    )
+    return runner
+
+
+async def _run_rich_agent(monkeypatch, tmp_path, *, rich_events=True):
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = RichFakeAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = _make_adapter(rich_events=rich_events, workspace_id="ws_123")
+    runner = _make_rich_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+
+    source = SessionSource(
+        platform=Platform.SAAS_WEB,
+        chat_id="conv_1",
+        chat_type="dm",
+        user_id="user_1",
+    )
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess_1",
+        session_key="agent:main:saas_web:dm:conv_1",
+        event_message_id="msg_user_1",
+    )
+    await asyncio.sleep(0.05)
+    return adapter, result
+
+
+class TestGatewayRichEvents:
+    @pytest.mark.asyncio
+    async def test_run_agent_emits_structured_runtime_events(self, monkeypatch, tmp_path):
+        adapter, result = await _run_rich_agent(monkeypatch, tmp_path, rich_events=True)
+
+        assert result["final_response"] == "Hello world"
+        events = list(adapter._events["conv_1"])
+        event_names = [event["event"] for event in events]
+        assert "status" in event_names
+        assert "reasoning.started" in event_names
+        assert "reasoning.summary" in event_names
+        assert "tool.started" in event_names
+        assert "tool.completed" in event_names
+        assert "step.completed" in event_names
+        assert event_names.count("message.delta") == 2
+
+        tool_started = next(event for event in events if event["event"] == "tool.started")
+        assert tool_started["tool_call_id"] == "call_1"
+        assert tool_started["run_id"] == "msg_user_1"
+        assert tool_started["reply_to"] == "msg_user_1"
+        assert tool_started["workspace_id"] == "ws_123"
+
+        tool_done = next(event for event in events if event["event"] == "tool.completed")
+        assert tool_done["duration_ms"] == 1234
+        assert len(tool_done["result_preview"]) <= 500
+        assert "x" * 600 not in tool_done["result_preview"]
+
+        reasoning = next(event for event in events if event["event"] == "reasoning.summary")
+        assert len(reasoning["summary"]) <= 1200
+        assert reasoning["truncated"] is True
+
+    @pytest.mark.asyncio
+    async def test_run_agent_omits_rich_events_when_disabled(self, monkeypatch, tmp_path):
+        adapter, result = await _run_rich_agent(monkeypatch, tmp_path, rich_events=False)
+
+        assert result["final_response"] == "Hello world"
+        assert not any("." in event["event"] for event in adapter._events.get("conv_1", ()))
 
 
 class TestConfig:

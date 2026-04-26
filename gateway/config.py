@@ -1101,6 +1101,7 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     saas_web_host = os.getenv("SAAS_WEB_HOST")
     saas_web_callback_url = os.getenv("SAAS_WEB_CALLBACK_URL", "")
     saas_web_callback_key = os.getenv("SAAS_WEB_CALLBACK_KEY", "")
+    saas_web_rich_events = os.getenv("SAAS_WEB_RICH_EVENTS", "")
     if saas_web_enabled or saas_web_key:
         if Platform.SAAS_WEB not in config.platforms:
             config.platforms[Platform.SAAS_WEB] = PlatformConfig()
@@ -1118,6 +1119,8 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             config.platforms[Platform.SAAS_WEB].extra["callback_url"] = saas_web_callback_url
         if saas_web_callback_key:
             config.platforms[Platform.SAAS_WEB].extra["callback_key"] = saas_web_callback_key
+        if saas_web_rich_events:
+            config.platforms[Platform.SAAS_WEB].extra["rich_events"] = saas_web_rich_events
         user_id = os.getenv("SAAS_WEB_USER_ID", "")
         user_name = os.getenv("SAAS_WEB_USER_NAME", "")
         workspace_id = os.getenv("SAAS_WEB_WORKSPACE_ID", "")

@@ -37,6 +37,7 @@ from gateway.platforms.base import (
     SendResult,
     is_network_accessible,
 )
+from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,21 @@ DEFAULT_PORT = 8652
 DEFAULT_MAX_BODY_BYTES = 1_048_576
 DEFAULT_EVENT_BUFFER_SIZE = 200
 DEFAULT_IDEMPOTENCY_TTL_SECONDS = 3600
+RICH_EVENT_TYPES = frozenset(
+    {
+        "run.started",
+        "run.completed",
+        "run.failed",
+        "message.delta",
+        "tool.started",
+        "tool.completed",
+        "tool.failed",
+        "step.completed",
+        "reasoning.started",
+        "reasoning.summary",
+        "status",
+    }
+)
 
 
 def check_saas_web_requirements() -> bool:
@@ -54,6 +70,8 @@ def check_saas_web_requirements() -> bool:
 
 class SaasWebAdapter(BasePlatformAdapter):
     """Internal HTTP adapter for a SaaS backend/frontend shell."""
+
+    SUPPORTS_MESSAGE_EDITING = False
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.SAAS_WEB)
@@ -92,6 +110,10 @@ class SaasWebAdapter(BasePlatformAdapter):
         )
         self._idempotency_ttl: int = int(
             extra.get("idempotency_ttl", DEFAULT_IDEMPOTENCY_TTL_SECONDS)
+        )
+        self.rich_events_enabled: bool = is_truthy_value(
+            extra.get("rich_events", os.getenv("SAAS_WEB_RICH_EVENTS")),
+            default=False,
         )
 
         self._runner = None
@@ -178,16 +200,24 @@ class SaasWebAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
+        event_metadata = metadata or {}
+        payload = {
+            "conversation_id": chat_id,
+            "message_id": f"msg_{uuid.uuid4().hex}",
+            "reply_to": reply_to,
+            "content": content,
+            "metadata": event_metadata,
+        }
+        run_id = event_metadata.get("run_id") or reply_to
+        parent_message_id = event_metadata.get("parent_message_id") or reply_to
+        if run_id:
+            payload["run_id"] = run_id
+        if parent_message_id:
+            payload["parent_message_id"] = parent_message_id
         event = self._record_event(
             conversation_id=chat_id,
             event_type="message",
-            payload={
-                "conversation_id": chat_id,
-                "message_id": f"msg_{uuid.uuid4().hex}",
-                "reply_to": reply_to,
-                "content": content,
-                "metadata": metadata or {},
-            },
+            payload=payload,
         )
 
         if not self._callback_url:
@@ -229,6 +259,7 @@ class SaasWebAdapter(BasePlatformAdapter):
                 "status": "ok",
                 "platform": "saas_web",
                 "callback_configured": bool(self._callback_url),
+                "rich_events_enabled": self.rich_events_enabled,
                 "workspace_id": self._workspace_id or None,
                 "workspace_name": self._workspace_name or None,
             }
@@ -351,6 +382,9 @@ class SaasWebAdapter(BasePlatformAdapter):
 
     def _record_event(self, *, conversation_id: str, event_type: str, payload: dict) -> dict:
         self._event_seq += 1
+        metadata = payload.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
         event = {
             "seq": self._event_seq,
             "event": event_type,
@@ -358,6 +392,7 @@ class SaasWebAdapter(BasePlatformAdapter):
             "conversation_id": conversation_id,
             "message_id": payload.get("message_id") or f"evt_{uuid.uuid4().hex}",
             "timestamp": datetime.now(timezone.utc).isoformat(),
+            "metadata": metadata,
             **payload,
         }
         workspace_id, workspace_name = self._conversation_workspaces.get(
@@ -369,6 +404,49 @@ class SaasWebAdapter(BasePlatformAdapter):
         if workspace_name and "workspace_name" not in event:
             event["workspace_name"] = workspace_name
         self._events[conversation_id].append(event)
+        return event
+
+    async def emit_runtime_event(
+        self,
+        conversation_id: str,
+        event_type: str,
+        payload: Optional[Dict[str, Any]] = None,
+        *,
+        run_id: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        parent_message_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[dict]:
+        """Record and deliver an opt-in rich runtime event.
+
+        ``message``, ``typing`` and ``error`` keep using their existing paths.
+        Rich runtime events are ignored unless explicitly enabled so current
+        SaaS integrations do not see new event kinds by surprise.
+        """
+        if not self.rich_events_enabled and event_type in RICH_EVENT_TYPES:
+            return None
+
+        body = dict(payload or {})
+        body["conversation_id"] = conversation_id
+        if run_id:
+            body["run_id"] = run_id
+        if reply_to:
+            body["reply_to"] = reply_to
+        if parent_message_id:
+            body["parent_message_id"] = parent_message_id
+        if metadata is not None:
+            body["metadata"] = metadata
+
+        event = self._record_event(
+            conversation_id=conversation_id,
+            event_type=event_type,
+            payload=body,
+        )
+        if self._callback_url:
+            try:
+                await self._post_callback(event)
+            except Exception as exc:
+                logger.debug("[saas_web] Rich event callback failed (%s): %s", event_type, exc)
         return event
 
     async def _post_callback(self, event: dict) -> None:
